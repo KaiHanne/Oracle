@@ -1,0 +1,772 @@
+#!/bin/bash 
+# ==============================================================================
+#
+#      File: execrcmd
+#            Yeah, I know what's in a name, ran out of ideas probably...
+#
+#      Date: Wed Feb 21 14:57:14 CET 2018
+#      What: Execute command(s), sqlstatement(s), sql-script etc. on specified 
+#            service as found in $GLOBAL_CNF/oracleservices.dat
+#       Who: Gert J. Willems 
+#
+# ==============================================================================
+# History:
+# Date       Rev   Author        What
+# ---------- ----- ------------- -----------------------------------------------
+# 21-02-2018 0.1   gjwillems     created
+# 22-02-2018 0.2   gjwillems     hostlist added; cmd function added ETC.
+# 01-03-2018 0.3   gjwillems     uptime function added (-u)
+# 04-03-2018 0.4   gjwillems     services counter added
+# 05-03-2018 0.5   gjwillems     orasync function added (-s)
+# 05-04-2018 0.6   gjwillems     dbid function added (-i)
+# 11-09-2018 0.7   gjwillems     Single SQL Script execution added: -S <script>
+# 09-22-2018 1.1   gjwillems     Lots of switches added:
+#                                -E perform actions based on Servicename or SID
+#                                -L create new services and SID list
+#                                -T tnsping
+#                                -D test / R&D section ;-)
+# 15-11-2018 1.2   gjwillems     List extended with EBS AppServers
+# 18-02-2019 1.3   gjwillems     -u switch improved: instances down are 
+#                                reported correctly
+# 21-03-2019 1.4   gjwillems     redesign of the commandline parser with
+#                                --long option support and optional arguments
+#                                to switches
+# 02-04-2019 1.5   gjwillems     -H --hostlist with optional hostname performs
+#                                most of the command for specific host
+# 26-04-2019 1.6   gjwillems     Pool services/SIDS added to object collection
+# 30-04-2019 1.7   gjwillems     improved hostlist handling in case of -H and
+#                                the phase switches
+# 06-06-2019 1.8   gjwillems     added the -C -csv option to generate comma 
+#                                separated output.
+# 24-06-2019 1.9   gjwillems     -E SERVICE bug fixed: display service instead 
+#                                of SID
+# 19-12-2019 1.10  gjwillems     bug fix: locked account reported as down
+#
+# ==============================================================================
+# set -xv
+#
+# slapcat example to get all SIDs
+# slapcat|grep "SERVICE_NAME="|sed 's/ .*SERVICE_NAME=//g'|sed 's/)//g'|egrep -vi "acc_|otw_|prd_|tst_"|sort -u|egrep '^[A-Z]{4}[0-9]'
+#
+
+mod="$(basename ${0})"
+rev="1.9"
+rev_date="Mon Jun 23 11:41:07 CEST 2019"
+SkipList="VOID"
+AllPhases=0
+ServicesList="$GLOBAL_CNF/oracleservices.dat"
+ServicesListBackup="$GLOBAL_CNF/oracleservices.bck"
+SIDList="${GLOBAL_CNF}/allsids.dat"
+HostSIDList="${GLOBAL_CNF}/hostsids.dat"
+EBSList="${GLOBAL_CNF}/ebsappservers.dat"
+
+HL=
+verbose=
+tnsping=
+orasync=
+sid=
+recsep=" "
+# save commanline arguments
+IFS=' ' read -r -a argList <<< "${@}"
+argc=${#}
+
+source "${GLOBAL_LIB:-/data/shared/global/lib}/libbash.sh"
+source "${GLOBAL_LIB:-/data/shared/global/lib}/liboracle.sh"
+
+# ============================================================================== 
+# usage
+# ------------------------------------------------------------------------------ 
+function usage () {
+   cat << EOH
+
+$mod ${rev} built ${rev_date}
+
+${mod} is able to perfom SQL scripts, Linux commands etc. based on a list of
+       services, oracle SID's or hosts.
+
+usage:
+   ${mod} {-A|o|t|a|p} [-c "command(s)"]
+
+   -u --uptime       check database/instance uptime(s)
+   -i --dbid         return database name and database ID
+   -A --all          use all service entries
+   -o --otw \\
+   -t --tst  |
+   -a --acc  |-      specify a specific phase
+   -m --mnt  |
+   -p --prd /      
+
+   -H --hostlist     use host-list (only in combination with a service phase)
+   -O --orasync      orasync for each host (in -o|t|a|p|A)
+   -s --sid          use ORACLE_SID (useful in combination with --hostlist/-H)
+   -E --execlist     <list> perform actions based of specified list: SERVICE, SID or EBS
+                     EBS only supports hostbased commands, and has an implicit -H switch added
+   -r --root         perform "commands" as ROOT (only with -c switch)
+   -T --tsnping      perform a tnsping
+   -k --skip         skip specified entries: entry1,entry2,..
+
+   -h --help         usage notes
+   -v --verbose      verbose output
+   -d --debug        debug: more information including verbose messages
+   -l --uniformlog   use uniform output logging
+   -C --csv          create ';' separated output 
+   
+   -L --servicelist  create new list of services and Oracle SID'd based on RMAN repo
+                     output is in ${ServicesList} and ${SIDList}
+
+examples:
+ 
+   Show (verbose) uptimes of all services:
+
+   ${mod} -v -u -A -E SERVICE
+     
+   Perform an orasync on all hosts:
+
+   ${mod} -O -A -H 
+
+   Run script.sql (located in ${GLOBAL_SQL}) on all ACC sid's:
+
+   ${mod} -a -E SID -s script.sql
+
+   For info & ER's mailto: DBB@Gelderland.nl
+
+   (c) 2018-2019 Provincie Gelderland I&A|RAS|DBB
+
+EOH
+   exit 1
+}
+
+[[ ${#} -eq 0 ]] && usage
+
+# ============================================================================== 
+# Get all Oracel SIDS from RMAN repo
+# ------------------------------------------------------------------------------ 
+function GetAllSids() {
+   local _self_=${FUNCNAME[0]}
+   [[ ${verbose} -eq 1 ]] && out "Entering function [${_self_}]"
+
+   out "creating list with all Oracle SIDS"
+
+   getp ${GLOBAL_CNF}/sys.dat
+   sqlplus -s /nolog > ${SIDList} << EOS
+   connect sys/${DWP}@rmap0 as sysdba
+set pagesize 0 feedback off termout off trimspool on linesize 100 echo off
+select distinct name
+from   rman.rc_database
+where  length( name ) = 5
+order  by name;
+EOS
+}
+
+# ============================================================================== 
+# Get Host list
+# ------------------------------------------------------------------------------ 
+function GetHostList() {
+   local _self_=${FUNCNAME[0]}
+   [[ ${verbose} -eq 1 ]] && out "Entering function [${_self_}]"
+
+   # set -xv
+   local i=0
+
+   [[ ${verbose} -eq 1 ]] && out ">>> HostListing [${HostListing}] <<<" 
+
+   if [ ! -z "${HostListing}" ]; then
+      echo "${HostListing}"|sed 's/,/\n/g' > .hl_$$
+      HostList=$(cat .hl_$$)
+      return 0
+   fi
+
+   if [ "${EList}" = "EBS" ]; then
+      # Populate the HostList array with EBS Appservers
+      GetObjectList "${EBSList}" 
+      HostList="${Array}"
+      printf ">> %s\n" "${HostList}" 
+      return 0
+   fi
+
+   [[ -z ${SLArr} ]] && out "Empty services list, specify services" && return 1
+
+   for srvs in $(printf "%s\n" ${SLArr})
+   do
+      host=$(tnsping ${srvs}| grep -i host|cut -d'=' -f5|sed 's/)(.*//g')
+      [[ ${i} -eq 0 ]] && HostList=$(printf "%s\n" ${host})
+      # Only add hosts which are not already part of HostList
+      echo "${HostList}" | grep -wq $"${host}"
+      [[ $? -eq 1 ]] && [[ ${i} -gt 0 ]] && \
+                     HostList=$(printf "${HostList}\n%s\n" ${host})
+      ((i+=1))
+   done
+}
+
+# ============================================================================== 
+# Execute Oracle SQL*Plus and check uptime
+# ------------------------------------------------------------------------------ 
+function oracleUpTime() {
+   local _self_=${FUNCNAME[0]}
+   [[ ${verbose} -eq 1 ]] && out "in call of function [${_self_}]"
+
+   tnsalias="${1}"
+   # [[ ${verbose} ]] && printf "argument in call '${_self_}( ${tnsalias} )'\n" >&2
+   [[ ${verbose} ]] && out "argument in call '${_self_}( ${tnsalias} )'" "DEBUG"
+   local pwd="* * * SCRAMBLED * * *"
+   getp ${GLOBAL_CNF}/system.dat
+
+#   [[ ${debug} ]] && out "Connect to: system/${pwd}@${tnsalias}"
+
+   sqlplus -L -S /nolog 2>/dev/null << EOS
+whenever sqlerror exit sql.sqlcode;
+   connect system/${DWP}@${tnsalias} 
+   set lines 300
+   set pagesize 0
+   set trimspool on
+   set verify off
+   col resultset      format a200
+
+select i.host_name ||';'|| 
+       i.instance_name ||';'||
+       s.name ||';'||
+       to_char(i.startup_time, 'dd-mm-yyyy hh24:mi:ss') ||';'||
+       (current_timestamp - startup_time) as resultset
+from   v\$instance i
+left outer join
+       v\$services s
+on     name = upper( '${tnsalias}' );
+EOS
+   return $?
+}
+
+# ============================================================================== 
+# Execute Oracle SQL*Plus and get database id 
+# ------------------------------------------------------------------------------ 
+function getDbId() {
+   local _self_=${FUNCNAME[0]}
+   [[ ${verbose} -eq 1 ]] && out "Entering function [${_self_}]"
+
+   tnsalias="${1}"
+   local pwd="* * * SCRAMBLED * * *"
+   getp ${GLOBAL_CNF}/system.dat
+
+#   [[ ${debug} ]] && out "Connect to: system/${pwd}@${tnsalias}"
+
+   sqlplus -L -S /nolog << EOS
+whenever sqlerror exit sql.sqlcode;
+   connect system/${DWP}@${tnsalias} 
+   set lines 200
+   set pagesize 0
+   set trimspool on
+   set verify off
+   col dbid           format 99999999999999990
+   col name           format a15
+select d.name
+,      d.dbid
+from   v\$database d;
+EOS
+   return $?
+}
+
+# ============================================================================== 
+# Execute Oracle's tnsping for service(s) 
+# ------------------------------------------------------------------------------ 
+function execTnsping () {
+   local _self_=${FUNCNAME[0]}
+   [[ ${verbose} -eq 1 ]] && out "Entering function [${_self_}]"
+
+   for tnsalias in $(printf "%s\n" "${GenArr}")
+   do
+      [[ ${verbose} ]] && out "tnsping ${tnsalias}"
+      tnsping ${tnsalias} 
+   done
+}
+# ============================================================================== 
+# Execute command(s) 
+# ------------------------------------------------------------------------------ 
+function execCommand () {
+   local _self_=${FUNCNAME[0]}
+   [[ ${verbose} -eq 1 ]] && out "Entering function [${_self_}]"
+
+   for host in $(printf "%s\n" "${HostList}")
+   do
+      if [ ${ROOT} ]; then
+         out "ssh root@${host} '${command}'" 
+         ssh root@${host} "${command}"
+      else
+         out "ssh ${host} '${command}'"
+         [[ ${uniformOtp} ]] && ssh ${host} "${command}" | redirect.pl \
+                             || ssh ${host} "${command}"
+      fi
+   done
+}
+
+
+# ============================================================================== 
+# Populate Objects Array i.e. Services or SID's
+# ------------------------------------------------------------------------------ 
+function GetObjectList () {
+   local _self_=${FUNCNAME[0]}
+   [[ ${verbose} -eq 1 ]] && out "Entering function [${_self_}]"
+
+   ObjectList="${1}"
+
+   [[ ${verbose} -eq 1 ]] && out "ObjectList => [${ObjectList}]"
+
+   [[ ${AllPhases} -eq 1 ]] && Array=$(cat ${ObjectList}|egrep -wv "${SkipList}" ) && return 0
+
+   case ${Phase} 
+   in
+      "OTW") Array=$(cat ${ObjectList} | egrep -wv "${SkipList}" | egrep -i '^otw|^[a-z]{3}o') ;;
+      "TST") Array=$(cat ${ObjectList} | egrep -wv "${SkipList}" | egrep -i '^tst|^[a-z]{3}t') ;;
+      "ACC") Array=$(cat ${ObjectList} | egrep -wv "${SkipList}" | egrep -i '^acc|^[a-z]{3}a') ;;
+      "PRD") Array=$(cat ${ObjectList} | egrep -wv "${SkipList}" | egrep -i '^prd|^[a-z]{3}p') ;;
+      "MNT") Array=$(cat ${ObjectList} | egrep -wv "${SkipList}" | egrep -i '^pl|^[a-z]{3}[dgvm]') ;;
+   esac
+}
+
+# ============================================================================== 
+# Create a list with host:sid combinations 
+# ------------------------------------------------------------------------------ 
+function CreateHostSidList() {
+   local _self_=${FUNCNAME[0]}
+   [[ ${verbose} -eq 1 ]] && out "Entering function [${_self_}]"
+ 
+   hslist="hslist.$$"
+   cat /dev/null > ${hslist} 
+
+   out "creating list with host:sid pairs..."
+
+   for sid in $(cat ${SIDList})
+   do
+      host=$(tnsping ${sid} |grep HOST=|cut -d'=' -f5|cut -d'.' -f1|cut -d')' -f1) 
+      printf "%s:%s\\n" "${host}" "${sid}" >> ${hslist} 
+   done 
+   cat ${hslist} | sort > ${HostSIDList}
+   rm -f ${hslist}
+}
+
+#function CommandLineParser() {
+
+   GOLIST=`getopt -o Aac:CDdE:H::hik:L:lmoOprS:sTtuv \
+--long all\
+,acc\
+,command:\
+,csv\
+,resadev\
+,debug\
+,execlist:\
+,hostlist:\
+,help\
+,dbid\
+,skiplist:\
+,listservices:\
+,uniformlog\
+,mnt\
+,otw\
+,orasync\
+,prd\
+,root\
+,script:\
+,sid\
+,tnsping\
+,tst\
+,uptime\
+,verbose \
+-n "${mod}" -- "$@"`
+
+   eval set -- "${GOLIST}"
+   [[ ${verbose}  -eq 1 ]] && out "getopt argc=[${#}]; shell argc=[$((argc--))]"
+
+   # extract options and their arguments into variables.
+   while true  
+   do
+      [[ ${verbose} -eq 1 ]] && out "CommandLineParser(): switch=>[${argc}] argv=>[${argList[$((argc--))]}]"
+
+      case "$1" 
+      in
+        -A|--all)          AllPhases=1
+                           phaseFull="ALL FASES" 
+                           shift ;;
+        -a|--acc)          Phase="ACC"
+                           phaseFull="ACCEPTATIE" 
+                           shift ;;
+        -c|--command)      command="${2}"
+                           shift 2 ;;
+        -C|--csv)          CSV=1 
+                           recsep=";"
+                           shift ;;
+        -D|--resadev)      RDSection=1 
+                           shift ;;
+        -d|--debug)        debug=1
+                           verbose=1 
+                           shift ;;
+        -E|--execlist)     EList="${2}"
+                           shift 2;;
+        -H|--hostlist)     HL=1
+                           case "${2}"
+                           in
+                              "") Null=0 
+                                  shift 2 ;;
+                               *) HostListing="${2}" 
+                                  grepHostList=$(echo "${2}"|sed "s/,/|/g")
+                                  shift 2 ;;
+                           esac ;;
+        -h|--help)         usage 
+                           shift ;;
+        -i|--dbid)         dbid=1
+                           shift ;;
+        -k|--skiplist)     # skip secified items from servicename list, host list etc.
+                           SkipList="${2}"
+                           shift 2;;
+        -L|--listservices) # create a new list of services
+                           # D = dynamic N = NON-dynamic and SERVICE_ID > 2
+                           cp ${ServicesList} ${ServicesListBackup}
+                           ListServices="${2}"
+                           case ${ListServices}
+                           in
+                              D|N) void=0 ; shift 2 ;;
+                              *) echo
+                                 out "with -L switch: either specify N of D" ERROR
+                                 usage; shift 2 ;;
+                           esac ;;
+        -l|--uniformlog)   # use uniform output logging with added redirect statements
+                           uniformOtp=1 
+                           shift ;;
+        -m|--mnt)          Phase="MNT"
+                           phaseFull="MAINTENANCE/POOL" 
+                           shift ;;
+        -o|--otw)          Phase="OTW"
+                           phaseFull="ONTWIKKEL" 
+                           shift ;;
+        -O|--orasync)      orasync=1
+                           shift ;;
+        -p|--prd)          Phase="PRD"
+                           phaseFull="PRODUCTIE" 
+                           shift ;;
+        -r|--root)         # perform command as root
+                           ROOT=1 
+                           shift ;;
+        -S|--script)       # run SQL*Plus with service name
+                           RunScript=1
+                           script="${2}" 
+                           shift 2;;
+        -s|--sid)          usesids=1
+                           shift ;;
+        -T|--tnsping)      # perform a tnsping
+                           tnsping=1 
+                           shift ;;
+        -t|--tst)          Phase="TST"
+                           phaseFull="TEST" 
+                           shift ;;
+        -u|--uptime)       uptime=1
+                           shift ;;
+        -v|--verbose)      verbose=1
+                           shift ;;
+        --)                shift ; break ;;
+         *)                printf "Parser error! (getopt)\\n" 
+                           printf "arguments: [${@}]\\n"
+                           exit 1 ;;
+    esac
+done
+      #[[ ${verbose} -eq 1 ]] && out "CommandLineParser(): switch=>[${argc}] argv=>[${argList[$((argc--))]}]"
+
+
+# ====== Commandline Parser ====================================================
+OPTERR=0
+
+# CommandLineParser "${@}"
+
+function old_parser() {
+while getopts ":k:uidhc:otapAHvrTlsS:L:DE:" argv
+do
+   case ${argv}
+   in
+      k) # skip secified items from servicename list, host list etc.
+         SkipList="${OPTARG}" ;;
+      L) # create a new list of services
+         # D = dynamic N = NON-dynamic and SERVICE_ID > 2
+         cp ${ServicesList} ${ServicesListBackup}
+         ListServices="${OPTARG}" 
+         case ${ListServices}
+         in
+            D|N) void=0 ;;
+            *) echo
+               out "with -L switch: either specify N of D" ERROR 
+               usage
+         esac
+         ;;
+      E) # exec based on specified list
+         EList="${OPTARG}" ;;
+      u) uptime=1 ;;
+      i) dbid=1 ;;
+      d) debug=1 
+         verbose=1 ;;
+      v) verbose=1 ;;
+      o) Phase="OTW"
+         phaseFull="ONTWIKKEL" ;;
+      t) Phase="TST"
+         phaseFull="TEST" ;;
+      a) Phase="ACC"
+         phaseFull="ACCEPTATIE" ;;
+      p) Phase="PRD"
+         phaseFull="PRODUCTIE" ;;
+      A) AllPhases=1 
+         phaseFull="ALL FASES" ;;
+      s) orasync=1 ;;
+      c) # command =
+         command="${OPTARG}" ;;
+      r) # perform command as root
+         ROOT=1 ;;
+      H) # hostlist request
+         HL=1 ;;
+      T) # perform a tnsping
+         tnsping=1 ;;
+      l) # use uniform output logging with added redirect statements
+         uniformOtp=1 ;;
+      S) # run SQL*Plus with service name
+         RunScript=1
+         script="${OPTARG}" ;;
+      D) # test switch
+         RDSection=1 ;;
+      h) # usage
+         usage ;;
+     \?) # invalid option or flag
+         printf "${mod}  ERR - invalid option -$OPTARG specified!\n" >&2
+         exit 1 ;;
+      :) # no mandatory argument
+         printf "${mod}  ERR - Option -$OPTARG requires an argument.\n" >&2
+         exit 1 ;;
+         
+   esac
+done
+}
+
+
+# ====== main scope ============================================================
+# Check if a new list of services is requested
+if [[ ! -z ${ListServices} ]]; then
+   printf ""  > ${ServicesList}   
+   GetAllSids
+   getp "${GLOBAL_CNF}/system.dat"
+   case ${ListServices}
+   in
+      D) # Dynamic services
+         predicate_suffix=" = 'DYNAMIC'" ;;      
+      N) # NON-Dynamic
+         predicate_suffix=" IS NULL" ;;      
+   esac
+
+   out "checking service names with predicate suffix: [${predicate_suffix}]"
+
+   # ===========================================================================
+   # this is not an elegant way to get rid of SID's that are down...
+   # It's a kind of awkward construction: SQLPlus errors come to STDOUT so we 
+   # redirect to the null device. The spool on a per SID basis is then at the 
+   # end append redirected to the list of service names.
+   # ===========================================================================
+   for SID in $(cat ${SIDList})
+   do
+      [[ ! -z ${verbose} ]] && \
+         out "Get service names for ORACLE_SID [${SID}]"
+
+      sqlplus -L -s system/${DWP}@${SID} 1>/dev/null << EOS
+      set pagesize 0 lines 100 echo off feedback off trimspool on
+      spool $SID
+      select name
+      from   v\$services
+      where  service_id > 2
+      and SESSION_STATE_CONSISTENCY ${predicate_suffix};
+      spool off
+EOS
+      [[ -s ${SID}.lst ]] && cat ${SID}.lst >> ${ServicesList}
+      rm -f ${SID}.lst
+   done
+fi
+
+# ------ always perform a get services and SID's -------------------------------
+[[ ${verbose} ]] && \
+   out "using phase: ${phaseFull:-\"Not specified, use -o|t|a|p|A(ll)\"}"
+
+# ------ Populate Services array -----------------------------------------------
+# Note: The services list could imply multiple occurences of the same SID
+#
+GetObjectList "${ServicesList}" 
+SLArr="${Array}"
+# ------ Populate ORACLE SID array ---------------------------------------------
+#
+GetObjectList "${SIDList}" 
+SIDArr="${Array}"
+
+[[ ${usesids} -eq 1 ]] && CreateHostSidList
+
+[[ ${verbose} ]] && out "Listing selected service names:" \
+                 && echo "${SLArr}"|redirect.pl
+
+[[ ${ROOT} ]] && [[ -z "${command}" ]] \
+   && out "'-r' switch ignored, no command specified"
+
+# ------ Set List Array's -----------------------------------------------------
+# default based on SID's 
+#
+case "${EList}"
+in
+   "SERVICE") Objects="Service"
+            GenArr="${SLArr}" ;;
+    ""|"SID") Objects="Oracle SID"
+            GenArr="${SIDArr}" ;;
+       "EBS") HL=1
+            AllPhases=1
+            Objects="EBS Appservers"
+            GenArr="${EBSArr}" ;;
+esac
+
+[[ ${verbose} ]] && out "Elist=[${EList}], HL=[${HL}]"
+
+if [ ${HL} -eq 1 ] ; then
+   GetHostList 
+   [[ ${verbose} ]] && out "Listing selected host names:" \
+                    && echo "${HostList}"|redirect.pl
+   # if then exec
+   [[ ${command} ]] && execCommand
+
+   GenArr=$(cat ${HostSIDList} | egrep "${grepHostList}"|cut -d':' -f2)
+fi
+
+# ------ tnsping section -------------------------------------------------------
+[[ ${tnsping} ]]    && execTnsping
+
+# ------ uptime section --------------------------------------------------------
+typeset -A result
+if [ ${uptime} ]; then
+   if [[ -z "${CSV}" ]] ; then
+      printf "\n%-18.18s %-15.15s %-20.20s %-20.20s %-20.20s\n" "Hostname" "Instance" \
+          "${Objects}" "Startup time" "Uptime" 
+      hr 18; hr 15; hr 20; hr 20; hr 26 1 
+   else
+      printf "\n%s;%s;%s;%s;%s\n" "Hostname" "Instance" "${Objects}" "Startup time" "Uptime" 
+   fi
+
+   for Object in $(printf "%s\n" "${GenArr}")
+   do
+      [[ ${verbose} ]] && out "loop through array, object=>${Object}" 
+      result=$(oracleUpTime "${Object}") 
+      es=${?}
+      ERR=$(echo ${result} | cut -d ':' -f1)
+      hostnme=$(echo ${result} | cut -d';' -f1)
+      instnce=$(echo ${result} | cut -d';' -f2)
+
+      [[ "${EList}" = "SERVICE" ]] && SID="${Object}"
+      [[ "${EList}" = "SID" ]] && SID=$(echo ${result} | cut -d';' -f2)
+
+      startuptme=$(echo ${result} | cut -d';' -f4)
+
+      [[ ${debug} ]] && out "RAW result set =[${result}]" "<<DEBUG>>" \
+                     && out "SQL return code: [${es}]" "<<DEBUG>>"
+
+      uptme=$(echo ${result} | cut -d';' -f5)
+
+      [[ ${debug} ]] && out "uptme var      =[${uptme}]" "<<DEBUG>>"
+ 
+      case ${es}
+      in
+          0) hostname="${hostnme}"
+             instance="${instnce}"
+             dbuptime="${uptme}" ;;
+         10) hostname=" "
+             instance="${Object}"
+             startuptme="DOWN" ;;
+         96) hostname=" "  
+             instance="${Object}"
+             startuptme="Account is locked" ;;
+        226) hostname=" " 
+             instance="${Object}"
+             startuptme="DOWN or listener error" ;;
+      esac
+      printf "%-18.18s%s%-15.15s%s%-20.20s%s%-20.20s%s%-26.26s\n" "${hostname}" \
+                                                                  "${recsep}" \
+                                                                  "${instance}" \
+                                                                  "${recsep}" \
+                                                                  "${instance}" \
+                                                                  "${recsep}" \
+                                                                  "${startuptme}" \
+                                                                  "${recsep}" \
+                                                                  "${dbuptime}"
+      dbuptime=" "
+      
+      [[ ${es} -eq 0 ]] && ((c+=1))
+   done 
+   echo
+   [[ ${c} ]] && printf "[%d] (unique) active %ss found\n\n" "${c}" "${Objects}"
+fi
+
+# ------ dbis section ----------------------------------------------------------
+if [ ${dbid} ]; then
+   printf "\n%-18.18s %15.15s\n" "Database name" "DBID" 
+   hr 18; hr 15 1
+   for Object in $(printf "%s\n" "${GenArr}")
+   do
+      getDbId "${Object}" | grep -v "^$"
+      [[ $? -eq 0 ]] && ((c+=1))
+   done 
+   echo
+fi
+
+# ------ orasync section -------------------------------------------------------
+if [ ${orasync} ]; then
+   if [ ${HL} ]; then
+      command="source /home/oracle/global/lib/liboracle.sh; \
+source /home/oracle/local/conf/oracle.conf; \
+orasync"
+      execCommand
+   else
+      out "specify -H with orasync function" ERROR
+      exit 1
+   fi
+fi
+
+function getHeader() {
+   grep -q HEAD1 ${1}
+   if [ ${?} -eq 0 ]; then
+      head1=$(grep HEAD1 ${1} | cut -d'=' -f2|sed 's/"//g')
+      head2=$(grep HEAD2 ${1} | cut -d'=' -f2|sed 's/"//g')
+   else 
+      return
+   fi 
+   printf "%s\\n" "${head1}"
+   printf "%s\\n" "${head2}"
+   return
+}
+
+# ------ runs sql script section -----------------------------------------------
+# Process script argument
+if [ ! -z ${RunScript} ]; then
+   getp ${GLOBAL_CNF}/system.dat
+
+   # overrule a phase selection over a hostlist selection i.e. if the -H switch 
+   # is active in combination with -o/t/a/p/m then the last one will overrule
+   # e.g. -H -o selects OTW instances.
+   TmpArr=${Array:-${GenArr}}   
+
+   [[ -s ${GLOBAL_SQL}/${script} ]] && SQL=${GLOBAL_SQL}/${script}
+   [[ -s ./${script} ]] && SQL=./${script}
+
+   getHeader "${SQL}" 
+
+   for tnsalias in $(printf "%s\n" "${TmpArr}")
+   do
+      [[ ${verbose} ]] && out "running SQL script for ${tnsalias}"
+      sqlplus -s /nolog << EOS
+      connect system/${DWP}@${tnsalias}
+      @${SQL}
+EOS
+   done
+
+   [[ -z ${SQL} ]] && out "specified script [${SQL}] not found" ERROR
+fi
+
+# ============================================================================== 
+# R&D section
+if [ ! -z ${RDSection} ]; then
+   for SID in $(printf "%s\n" "${SIDArr}")
+   do
+      out "SID for phase [${phaseFull}] => ${SID}" 
+   done
+fi
+# ====== end of ================================================================
