@@ -1,0 +1,767 @@
+#!/bin/bash
+################################################################################
+#
+#       $Header: /home/oracle/trivento/bin/RCS/functions.lib,v 1.1 2009/06/11 11:36:53 oracle Exp oracle $
+#
+#         Name : liboracle.sh
+#        About : <About> 
+#
+#     $Revision: 1.0.0$
+#
+#   Author(s)  : Gert J. Willems <gjwillems@gmail.com>
+#
+#   Parameters : [MANDATORY!]
+#
+#                [OPTIONAL]
+#
+# Dependencies : 
+#
+#
+# ------------------------------------------------------------------------------
+# $Log: functions.lib,v $
+# Revision 1.1  2009/06/11 11:36:53  oracle
+# Initial revision
+#
+# .....
+# Revision 1.9  2014/12/30 09:04:00  gertjanw 
+# a lot since 1.1: getpassword function added: TPS is mandatory!!!!
+#
+# ------------------------------------------------------------------------------ 
+# ============================================================================== 
+# History
+# Date     Rev    Author      What?
+# -------- ------ ----------- --------------------------------------------------
+# 20170621 1.0.0  gjwillems   created, separated from libbash.sh
+# 20170907 1.1.0  gjwillems   orasync was alias -> function
+# 20171002 1.2.0  gjwillems   common functions moved to libdbcommon.sh
+# 20171004 1.3.0  gjwillems   oramem added: count ipcs memory segments
+# 20171018 1.4.0  gjwillems   asm added
+# 20180226 1.5.0  gjwillems   cron_orasync added
+# 20180301 1.6.0  gjwillems   getp function added
+# 20180301 1.7.0  gjwillems   setp function added
+# 20180618 1.7.1  gjwillems   asm function modded
+# 20180618 1.8.1  gjwillems   sid function improved with OPatch in SID depended
+#                             PATH; all functions exported
+# 20190618 1.9.1  gjwillems   sid function improved with error when invalid SID 
+#                             is specified.
+# 20190215 1.10.1 gjwillems   dbup added
+# 20190403 1.11.1 gjwillems   cleanup ORACLE_HOME/bin/*O old compiler files
+# 20190403 1.12.1 gjwillems   tnstrace function added
+#
+# ------------------------------------------------------------------------------
+#                        COPYRIGHT (C) 2000-2019, ITASSIST 
+################################################################################
+# set -xv
+
+# ====== Aliasses  =============================================================
+# ---- Local variables and initialisation --------------------------------------
+#
+
+TS=$(date +"%T %F")
+HOST=$(hostname -s)
+
+source "${GLOBAL_LIB:-/data/shared/global/lib}/libgeneric.sh"
+
+# ==============================================================================
+# show version information of this library
+# ---------------------------V--------------------------------------------------
+function liboracle_version() { ## print the current liboracle version
+   local _self_=${FUNCNAME[0]}
+   local LIB="liboracle.sh"
+   local LB_REV="$Revision: 1.12.1 $" 
+   local LB_REV_DATE="Wed Jun 19 07:50:30 CEST 2019"
+
+   printf "%s revision %s build: %s\n" "${LIB}" "${LB_REV}" "${LB_REV_DATE}"
+}
+
+# ===== instance ===============================================================
+# Show which instances are up-and-running
+# ---------------------------V--------------------------------------------------
+function instance() {        ## show up-and-running Oracle instances
+   is oracle ; [[ $? -eq 1 ]] && return
+   eval ${DEBUG:-""} 
+   checkConnection=0
+
+   echo $*
+   while getopts "c" ARGV
+   do
+      case ${ARGV}
+      in
+         c) # check connection
+            export checkConnection=1 ;;      
+      esac
+   done 
+
+   printf "\nActive Database instances found:\n"
+   for info in $(ps -edalf | grep _pmon_ | sort -k 15 | grep -v grep \
+                           | awk '{ printf "%s:%s\n", $4, $15}')
+   do
+        instance=$(echo ${info} | awk -F: '{print $2}' | awk -F_ '{print $3 }')
+        pid=$(echo ${info} | awk -F: '{print $1}')
+        
+   # Do we want to check connectivity?
+        if [ ${checkConnection} -eq 1 ]
+        then        
+           sqlplus -L -S check/check@${instance}
+        fi
+        printf "%s with PMON PID: %s\n" "${instance}" ${pid}
+   done
+   echo
+}
+
+# ==============================================================================
+#
+# ---------------------------V--------------------------------------------------
+function _sid_status() {     ## Oracle SID status report
+   is oracle ; [[ $? -eq 1 ]] && return
+
+   SID=${1}
+   ps -ef | grep pmon_${SID} | grep -v grep > /dev/null
+   if [ $? -eq 0 ]
+   then
+      STATUS="active"
+   else
+      LISTENER="lsnr_$(hostname -s)"
+      STATUS="inactive"
+      if [ "${SID}" = "agent" -o "${SID}" = "${LISTENER}" ] ; then
+         agent_pc=$(ps -edalf|grep emagent|grep -v grep|wc -l)
+         if [ ${agent_pc} -eq 0 ]; then
+            STATUS="inactive"
+         else
+            STATUS="active"
+         fi
+      else
+         OBSERVER="dgobserver"
+         if [ "${SID}" = "observer11" ]; then
+            ps -edalf | grep -v grep | grep ${OBSERVER}
+         fi
+      fi
+
+   fi
+   echo "${STATUS}"
+}
+
+# ==============================================================================
+# Get the status of an ORACLE_SID
+# ---------------------------V--------------------------------------------------
+function get_sid_state() {   ## Oracle SID status report
+   is oracle ; [[ $? -eq 1 ]] && return
+   export ORACLE_SID=${1}
+   export ORACLE_HOME=$(grep ^$ORACLE_SID /etc/oratab|cut -d ':' -f 2)
+   export PATH=$ORACLE_HOME/bin:$PATH
+   
+   LISTENER="lsnr_$(hostname -s)";
+   OBSERVER="observer11";
+   DBSTATE="0" 
+   case ${SID}
+   in
+            "agent" ) # agent
+                        ps -edalf|grep emagent|grep -v grep >/dev/null
+                        rval=$?
+                        ;;
+      "${LISTENER}" ) # listener
+                        ps -edalf|grep ${LISTENER}|grep -v grep >/dev/null
+                        rval=$?
+                        ;;
+      "${OBSERVER}" ) # Observer
+                        ps -edalf|grep observer|grep -v grep >/dev/null
+                     rval=$?
+                        ;;
+                   *) # database 
+                        ps -edalf|grep pmon_${ORACLE_SID}|grep -v grep >/dev/null
+                        rval=$?
+                        if [ $rval -eq 0 ]; then
+                        DBSTATE=$(sqlplus -s /nolog << EOS
+                                  connect / as sysdba
+                                  set linesize 100
+                                  set trimspool on
+                                  set feedback off
+                                  set pagesize 0
+                                  select lower( a.status ||'/'||a.database_status||'/'||b.open_mode ) as state
+                                  from v\$instance a, v\$database b
+                                  ;
+EOS
+)
+                        fi
+                        ;;
+   esac
+
+   if [ "$DBSTATE" != "0" ]; then
+      echo $DBSTATE
+   elif [ $rval -eq 0 ]; then
+      echo "active"
+   else
+      echo "inactive"
+   fi
+}
+
+# ==============================================================================
+#
+# ---------------------------V--------------------------------------------------
+function get_sid_status() {  ## Oracle status report for specified service
+   is oracle ; [[ $? -eq 1 ]] && return
+   SID=${1}
+
+   LISTENER="lsnr_$(hostname -s)";
+   OBSERVER="observer11";
+   
+   case ${SID}
+   in
+            "agent" ) # agent
+                        ps -edalf|grep emagent|grep -v grep >/dev/null
+                        rval=$?
+                        ;;
+      "${LISTENER}" ) # listener
+                        ps -edalf|grep ${LISTENER}|grep -v grep >/dev/null
+                        rval=$?
+                        ;;
+      "${OBSERVER}" ) # Observer
+                        ps -edalf|grep observer|grep -v grep >/dev/null
+                     rval=$?
+                        ;;
+                   *) # database 
+                        ps -edalf|grep pmon_${SID}|grep -v grep >/dev/null
+                        rval=$?
+                        ;;
+   esac
+
+   if [ $rval -eq 0 ]; then
+      echo "active"
+   else
+      echo "inactive"
+   fi
+}
+
+# ===== listener ===============================================================
+# Check if the listener is up adn running
+# ---------------------------V--------------------------------------------------
+function listener() {        ## check if Oracle listener is up-adn-running
+   is oracle ; [[ $? -eq 1 ]] && return
+   ListenerNme=$(ps -edalf|grep lsn|grep -v grep|rev|cut -d ' ' -f 2|rev)
+   [[ -z ${ListenerNme} ]] && echo Listener name not found! && return
+
+   lsnrctl status ${ListenerNme} | head -17
+   printf "\nEr zijn %s services beschikbaar (READY)\n\n" $(lsnrctl status ${ListenerNme} | grep READY|wc -l)
+}
+
+
+# ===== sid ====================================================================
+# Set or list the currently defined ORACLE SID's
+# ---------------------------V--------------------------------------------------
+function sid() {             ## Set or list Oracle SID's
+    is oracle;
+    [[ $? -eq 1 ]] && return;
+    local _self_="${FUNCNAME[0]}"
+    exclude="^SET_GRID|^SET_DB12";
+    OHOME_OLD="${ORACLE_HOME}";
+    SID_OLD="${ORACLE_SID}";
+    OT="${ORATAB:-/etc/oratab}"
+
+    eval ${DEBUG:-""};
+
+    while getopts "ls" ARGV; do
+        case ${ARGV} in 
+            s)
+                ps -edalf | head -1;
+ 		hr 89 1
+                for sid in $(sid | grep -v specified|grep -v '^$');
+                do
+                    ps -edalf | grep _pmon_${sid} | grep -v grep;
+                    if [ $? -eq 1 ]; then
+                        printf "\n\t!WARNING >> SID %s is DOWN [no pmon process found]\n\n" ${sid};
+                    fi;
+                done
+            ;;
+            l)
+
+            ;;
+        esac;
+    done;
+    export OPTIND=1;
+
+    if [ ! -z "${1}" -a "${1}" != "-s" -a "${1}" != "-l" ]; then
+        printf "\nSetting up Oracle environment for ${1}\n";
+        export ORAENV_ASK=NO;
+        export ORACLE_SID=${1};
+        grep -q "${ORACLE_SID}" ${OT}
+
+        [[ $? -eq 1 ]] && printf "${_self_} ERR - unknown oracle sid [${ORACLE_SID}] specified!\\n" \
+                       && export ORACLE_SID="${SID_OLD}" \
+                       && return 1
+
+        . /usr/local/bin/oraenv;
+        printf "Oracle home is set to: %s\n" ${ORACLE_HOME};
+        printf "Env is set\n";
+    else
+        if [ "${1}" = "-l" ]; then
+            if [ -f ${OT} ]; then
+                cat ${OT} | egrep -v "^#|^$|${exclude}" | awk -F: '{ printf "%s\n",$1 }' | sort;
+            fi;
+        else
+            if [ "${1}" != "-d" ]; then
+                printf "\nNo Oracle SID specified, valid sids are:\n";
+                if [ -f ${OT} ]; then
+                    cat ${OT} | egrep -v "^#|^$|${exclude}" | awk -F: '{ printf "\t%s\n",$1 }' | sort;
+                fi;
+            fi;
+        fi;
+    fi;
+
+    export ORAENV_ASK=YES;
+
+    [[ "${OHOME_OLD}" == "${ORACLE_HOME}" ]] && return 0;
+    echo ${PATH} | grep -q "OPatch";
+    rv=${?};
+    [[ "${rv}" -eq 1 ]] && export PATH="${PATH}:${ORACLE_HOME}/OPatch" && return 0;
+    export PATH=$(echo ${PATH} | sed -e "s:${OHOME_OLD}:${ORACLE_HOME}:g")
+}
+
+# ==============================================================================
+# Checkif all DEFINED oracle processes are up-and-running
+# ---------------------------V--------------------------------------------------
+function orastats() {        ## List oracle processes on the system
+   is oracle ; [[ $? -eq 1 ]] && return
+   # set -xv
+   # -d is the detailed option
+   local RunFlg=1
+   Detailed=
+
+   while getopts "d" ARGV
+   do
+      case ${ARGV}
+      in
+         d) # check detailed 4 some items...
+                export Detailed=1 ;;
+      esac
+   done
+
+   printf "\nOracle: is everything up and running:\n" 
+   for (( idx=0; idx < ${#ENVNAME[@]}; idx++ ))
+   do
+      case ${ENVNAME[${idx}]}
+      in
+         'db') db 
+               instance
+               listener
+               RunFlg=$?
+                ;;
+         'oms') oms
+                echo
+                emctl status oms 
+                if [ -z $Detailed ]; then
+                   opmnctl status
+                fi             
+      RunFlg=$?
+                echo 
+                ;;
+         agent) agent
+                echo
+                emctl status agent 
+      RunFlg=$?
+                echo 
+                ;;
+      esac
+      if [ ${RunFlg} -ne 0 ]; then
+         printf "No services defined and active on this host\n\n"
+      fi
+   done
+}
+
+
+# ==============================================================================
+# Check if the DEFINED oracle SID in ORATAB are valid
+# ---------------------------V--------------------------------------------------
+function rsids() {           ## check the validity of oracle SID's in oratab
+   is oracle ; [[ $? -eq 1 ]] && return
+   # set -xv
+   _SELF=rsids
+        ODATA=/oracle/oradata
+        OREC=/oracle/flash_recovery_area
+
+        # check if defined SID (in ORATAB) is still "relevant"
+        # on this host
+        for SID in $(cat ${ORATAB:-/etc/oratab} | egrep -v "^#|^$" | awk -F: '{ printf "%s\n",$1 }' | sort)
+        do
+                UPPERSID=$(echo $SID | tr "[a-z]" "[A-Z]")
+                if [ -d ${ODATA}/${UPPERSID}/${SID} -a -d ${OREC}/${UPPERSID} ]; then
+                        printf "${_SELF}: Oradata and OraReco are defined: [${SID}] valid SID\n"
+                else
+                        printf "${_SELF}: Oradata and/or OraReco are NOT defined!: [${SID}] obsolete SID\n"
+                fi
+        done
+
+}
+
+# ==============================================================================
+#
+# ---------------------------V--------------------------------------------------
+function _sids_() {            ## another SID's function ....
+   local _self_=${FUNCNAME[0]}
+   printf "function ${_self_} is obsolete\n" && return
+
+   is oracle ; [[ $? -eq 1 ]] && return
+   printf "\n${_self_} - Oracle System ID listing:\n\n"
+
+   if [ -f /etc/oratab ]
+   then
+      DEFAULT_HOME=`grep '^*' ${ORATAB} | cut -d: -f2`
+      export ORACLE_HOME=${DEFAULT_HOME}
+      export NLS_LANG=american_america.UTF8
+   
+      pathmunge "${ORACLE_HOME}/bin" before
+   
+      alias inst="grep -v '^$' ${ORATAB} | grep -v '^#' | grep -v '^+' | grep -v '^*' | cut -d: -f1"
+   
+      printf "%-10s%25s %-50s %-3s\n" "SID" "state" "oracle-home" "def"
+      printf "========= ========================= ================================================== ===\n"
+   
+      for ORATAB_ROW in `grep -v '^$' ${ORATAB} | grep -v '^#' | grep -v '^+' | grep -v '^*'`
+      do
+         ORACLE_SID=`echo ${ORATAB_ROW} | cut -d: -f1`
+         ORACLE_HOME=`echo ${ORATAB_ROW} | cut -d: -f2`
+         DEFAULT_START=`echo ${ORATAB_ROW} | cut -d: -f3`
+         #
+         # Create the ksh-statement
+         #
+         statement="alias ${ORACLE_SID}=""'""export ORACLE_SID=${ORACLE_SID}"';'"export ORAENV_ASK=NO"';'"export ORACLE_BASE=/opt/oracle"';'". ${ORAENV}"';'"'"
+         eval $statement
+         #
+         # Check if Oracle service is running
+         #
+         STATUS=$(get_sid_state ${ORACLE_SID})
+         printf "%-10s%25s %-50s  %-2s\n" ${ORACLE_SID} "${STATUS}" ${ORACLE_HOME} ${DEFAULT_START}
+      done
+   printf "\n"
+
+   else
+      echo "No oratab file found"
+      export ORACLE_HOME=${ORACLE_BASE}/product/10.2.0/db_1
+      export PATH=${ORACLE_HOME}:${PATH}
+   fi
+}
+
+
+# ==============================================================================
+#
+# ---------------------------V--------------------------------------------------
+function orap()              ## show oracle proceslists
+{
+   is oracle ; [[ $? -eq 1 ]] && return
+   store="/tmp/.tmp.$$"
+   pids="${1}"
+   pc=0
+   printf "\n------ Oracle System Processes Monitor ------\n\n";
+   ps -C oracle -eo user,pid,pcpu,stime,pri,sz,command | grep -v grep | egrep -q "_smon_|lsnr|emagent|dgmgrl";
+   rv=${?};
+   if [ ${rv} -eq 1 ]; then
+      printf "No oracle databases up-and-running\n";
+   else
+      ps -w -C oracle -eo user=User,pid,cputime=CPU_Time,pcpu,lstart=Running_Since,pri=Pri,command=Process,wchan=Current_Kernel_Function,rss=Size | head -1;
+      printf "%s-------- ----- -------- ---- ------------------------ --- --------------------------- ----------------------- --------\n";
+      if [ -z ${1} ]
+      then
+         ps -w --sort=command -C oracle -eo user,pid,cputime,pcpu,lstart,pri,command,wchan=Current_Kernel_Function,rss | egrep -v "perl|grep" | egrep "_smon_|apex.war|agent"| tee ${store};
+         t=$(cat ${store}|wc -l)
+         ps c --sort=command -w -C oracle -eo user,pid,cputime,pcpu,lstart,pri,command,wchan=Current_Kernel_Function,rss | egrep -v "perl|grep" | egrep "lsnr|dgmgrl"| tee ${store};
+         tt=$(cat ${store}|wc -l)
+         ((pc=t+tt))
+      else
+         ps -w --sort=command -C oracle -eo user,pid,cputime,pcpu,lstart,pri,command,wchan=Current_Kernel_Function,rss | egrep -v "perl|grep" | egrep "${pids}"| tee ${store};
+         t=$(cat ${store}|wc -l)
+         pc=${t}
+      fi
+   fi;
+   printf "\nTotal processes found: [%d]\n" "${pc}"
+   echo
+}
+
+# ==============================================================================
+#
+# ---------------------------V--------------------------------------------------
+function orapatch() {        ## show Oracle's patch inventory
+   is oracle ; [[ $? -eq 1 ]] && return
+   rv=$(grep ^${1} /etc/oratab)
+   [[ -z ${rv} ]] && echo Unkown oracle_sid specified! && return 1
+   store="/tmp/.opatch.${1}"
+   OLD_PATH=${PATH}
+   export ORACLE_SID=${1}
+   export ORAENV_ASK=NO
+   source /usr/local/bin/oraenv
+
+   # get an Oracle patch inventory
+   export PATH=${PATH}:${ORACLE_HOME}/OPatch
+   opatch lsinventory ${2} | tee ${store}
+
+   # restore the old path
+   export PATH=${OLD_PATH}
+}
+
+
+# ==============================================================================
+#  Get the oracle trace (background_dump_dir) directory for active SID
+# ---------------------------V--------------------------------------------------
+function get_trace_dir() {   ## get the oracle trace directory for current SID
+   is oracle ; [[ $? -eq 1 ]] && return
+   [[ -z ${ORACLE_SID} ]] && echo $0: NO oracle SID set && return
+
+   sqlplus -s /nolog << EOS
+   connect / as sysdba
+   set trimspool on feedback off lines 200 pages 0
+   select value
+   from  v\$parameter
+   where name = 'background_dump_dest';
+EOS
+}
+
+function trace () {
+    cd /data/app/oracle/diag/rdbms/$(lower ${ORACLE_SID})/${ORACLE_SID}/trace
+}
+
+function tnstrace () {
+    cd /data/app/oracle/diag/tnslsnr/$(hostname -s)/listener/trace
+}
+
+# ==============================================================================
+#
+# ---------------------------V--------------------------------------------------
+function sidsup() {          ## show Oracle SID's that are up
+   local _self_=${FUNCNAME[0]}
+   is oracle ; [[ $? -eq 1 ]] && return
+   cache=/tmp/.last_active_sids
+   printf "\n${_self_} - Active Oracle System ID listing:\n"
+   hr 60 1
+   ps -efa | grep _smon | grep -v grep | awk '{ printf "%s\n", $8}' | cut -d '_' -f 3 | tee ${cache}
+   echo
+}
+
+# ==============================================================================
+# check Oracle's Fusion Middleware
+# ---------------------------V--------------------------------------------------
+function fusion_status {     ## Show Oracle's Fusion Middleware processes
+   echo
+   ps -edalf | head -1
+   echo
+   ps -edalf | grep -v grep |grep -v agent12c| grep -i "httpd"
+   ps -edalf | grep -v grep |grep -v agent12c| grep -i "java"
+   ps -edalf | grep -v grep |grep -v agent12c| grep -i "forms"
+   ps -edalf | grep -v grep |grep -v agent12c| grep -i "reports"
+   echo
+}
+
+# ==============================================================================
+# List all functions in $0 (this lib)
+# ---------------------------V--------------------------------------------------
+function liboracle() {       ## Show all the defined functions in liboracle.sh
+   echo
+   liboracle_version
+   printf "\nFunction          Description"
+   printf "\n--------          ----------------------------------------------------\n"
+
+   grep -i ^"function [a-z]" "${GLOBAL_LIB}/liboracle.sh" | \
+   egrep -v "^EOS|^TS|^declare" | \
+   sed 's/function //g' | \
+   sed 's/()//g'        | \
+   sed 's/{/ /g'        | \
+   sort 
+   echo 
+}
+
+# ==============================================================================
+# sync the NFS shared /data/shared based on makefile directives
+# ---------------------------V--------------------------------------------------
+function orasync () {
+   local _self_=${FUNCNAME[0]}
+   export MAKEFILES=/data/shared/global/bootstrap/makefile
+   rm -f ${HOME:-"/home/${USER:-oracle}"}/built_profile \
+         ${HOME:-"/home/${USER:-oracle}"}/announce
+   make -C ${HOME:-"/home/${USER:-oracle}"} user=${USER:-oracle} \
+   OSID=${ORACLE_SID} sync_all ${@}
+   unset MAKEFILES
+}
+
+# ==============================================================================
+# count the total of memory segments in ipcs in use by Oracle instances
+# ---------------------------V--------------------------------------------------
+function oramem() {
+   local _self_=${FUNCNAME[0]}
+   hr 60 1
+   printf "| ipcs Shared Memory Segments in use by Oracle processes:  |\n"
+   hr 60 1
+   smsc=$(ipcs -m | grep oracle | wc -l) 
+   printf "Oracle has [%d] SMS's in use\n" ${smsc}
+   ipcs -m | grep oracle | \
+      awk '{ sum=sum+$5 } END { printf "Total memory: %s MB\n", sum/1024/1024 }'
+   hr 60 1
+}
+
+# ==============================================================================
+# exec an asmcmd command and return to the original ORACLE_SID
+# ---------------------------V--------------------------------------------------
+function asm () {            ## exec asmcmd <argv> 
+   local _self_=${FUNCNAME[0]}
+
+   ls -1 /etc/udev/rules.d/ | grep -qi asm
+   isasm=$?
+   [[ ${isasm} -ne 0 ]] && \
+      printf "${_self_}: INFO - ASM NOT IN USE on this server [${HOST}]\n" && \
+      return 1
+ 
+   export PSID=${ORACLE_SID}
+   sid +ASM 1>/dev/null 2>&1
+   asmcmd ${@}
+   sid ${PSID} 1>/dev/null 2>&1
+}
+
+# ==============================================================================
+# I'm not gonna explain...
+# ---------------------------V--------------------------------------------------
+function getp () {           ## exec getp <input-file> 
+   local _self_=${FUNCNAME[0]}
+   input=${1}
+   seed="${GLOBAL_CNF}/.gpsd"
+   DWP=$(openssl enc -aes-256-cbc -d -in ${input} -base64 -pass file:${seed})
+   export DWP
+}
+
+# ==============================================================================
+# yeah, again, I'm not gonna explain...
+# ---------------------------V--------------------------------------------------
+function setp () {
+   local _self_=${FUNCNAME[0]};
+   [[ -z ${1} ]] && echo username is 1st mandatory argument! && return 1
+   [[ -z ${2} ]] && echo password is 2nd mandatory argument! && return 1
+
+   output=${GLOBAL_CNF}/${1}.dat
+   input=$$.tmp;
+   echo ${2} > ${input}
+
+   seed="${GLOBAL_CNF}/.gpsd";
+   openssl enc -aes-256-cbc -e -in ${input} -out ${output} -base64 -pass file:${seed};
+   rm -f ${input}
+}
+
+# ==============================================================================
+# orasync 2 be called from cron
+# ---------------------------V--------------------------------------------------
+function cron_orasync () {
+   local _self_=${FUNCNAME[0]}
+   export MAKEFILES=/data/shared/global/bootstrap/makefile
+
+   ora_conf="${HOME:-"/home/${USER:-oracle}"}/local/conf/oracle.conf"
+   [[ -s ${ora_conf} ]] && source ${ora_conf} 1>/dev/null 2>&1
+   [[ ! -s ${ora_conf} ]] && export ORACLE_SID="DUMMY"
+   
+   make -C ${HOME:-"/home/${USER:-oracle}"} user=${USER:-oracle} \
+   OSID=${ORACLE_SID} sync_all ${@} | /home/oracle/global/bin/redirect.pl
+   unset MAKEFILES
+}
+
+# ==============================================================================
+# get Top trace elapsed lines from profiled file
+# ---------------------------V--------------------------------------------------
+function top_trace () {
+   local _self_=${FUNCNAME[0]}
+   local argv
+   local OPTIND
+   local OPTARG
+
+   while getopts "s:e:" argv
+   do
+      case ${argv}
+      in 
+         e) # edit on line
+            local line=${OPTARG} ;;
+         s) secnds=${OPTARG} ;;
+      esac
+   done
+
+   sec=${secnds:-1.00}
+
+   [[ $# -eq 1 ]] && local inf=${1}
+   [[ $# -eq 3 ]] && local inf=${3}
+   [[ $# -eq 5 ]] && local inf=${5}
+
+   [[ ! -s ${inf} ]] && printf "${_self_} ERR - inputfile [${inf}] not found\n" \
+                     && printf "usage: ${_self_} <inputfile> [min seconds]\n" \
+                     && return 1
+
+   [[ ${line} ]] && vim +${line} ${inf} && return 0
+
+   printf "\nline:pattern        elapsed\n"
+   hr 19 
+   hr 7 1
+   grep -n ^total ${inf} | \
+   awk -v sec=${sec} '{ if ($4 >= sec){ printf "%-20.20s %6.2f\n",$1,$4 }}'
+   printf "rv=>[$?]\n"
+   [[ $? -eq 1 ]] && printf "No data found\n"
+   echo
+}
+
+# ==============================================================================
+# check if the database is available: up/down, no listener, invalid un/pw
+# ---------------------------V--------------------------------------------------
+function dbup()              ## check if DB is available returns 0 1 2 3 or 4
+{
+   local _self_=${FUNCNAME[0]}
+ 
+   _sp_ () {
+      getp ${GLOBAL_CNF}/system.dat
+      sqlplus -s -L system/${DWP}@${ORACLE_SID} << EOS
+      exit
+EOS
+   return $?
+   }
+
+   # echo ${result}
+
+   result=$(_sp_ | grep "ORA-"|cut -d':' -f1)
+
+   case ${result}
+   in 
+      ORA-01034) return 1;; # oracle not available
+      ORA-12514) return 2;; # no listener process
+      ORA-01017) return 3;; # invalid username/password
+      ORA-*)     return 4;; # all others...
+   esac
+   return 0
+}
+
+# ==============================================================================
+# check if the database is available: up/down, no listener, invalid un/pw
+# ---------------------------V--------------------------------------------------
+function cleanup_old() {     ## Cleanup copiler file like oracleO etc.
+   local _self_=${FUNCNAME[0]}
+   local filelist="oracleO rmanO extjoboO extjobO kfedO"
+   local size removed
+
+   oratab="/etc/oratab"
+   
+   if [ -s "${oratab}" ]; then
+      for directory in $(cat ${oratab} | egrep -v "^#|^$"|cut -d':' -f2|sort -u)  
+      do
+         for file in $(printf "%s\n" "${filelist}")
+         do
+            filepath="${directory}/bin/${file}"
+            if [ -s ${filepath} ]; then
+               fuser -s ${filepath} 
+               [[ $? -eq 1 ]] && size=$(ls -sh ${filepath}|cut -d' ' -f1) \
+                  && out "file: ${filepath} size: ${size} is removed." \
+                  && removed=1 \
+                  && rm -f ${filepath}
+            fi
+         done
+      done
+      [[ -z ${removed} ]] && out "No 'old' compiler files found."
+   else
+      out "file ${oratab} not found!" ERROR
+   fi 
+}
+
+
+# Call then init proc
+# ==============================================================================
+# export the functions
+# ---------------------------V--------------------------------------------------
+_export_functions_
+# ----- enf of functions.lib ------------------------------------------------------
+
