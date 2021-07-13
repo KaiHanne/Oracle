@@ -1,0 +1,274 @@
+#!/bin/bash
+################################################################################
+#
+#       $Header: /beheer/sysmgmt/lib/RCS/functions.lib,v 1.1 2009/06/11 11:36:53 oracle Exp oracle $
+#
+#         Name : liborabaseline.sh
+#        About : functions library to implement/correct RAS|DBB baseline
+#
+#     $Revision: 1.1.0$
+#
+#   Author(s)  : Gert J. Willems <gjwillems@itassist.nl>
+#
+# Dependencies : libbash.sh
+#
+# ------------------------------------------------------------------------------
+# ==============================================================================
+# History
+# Date     Rev   Author      What?
+# -------- ----- ----------- ----------------------------------------------------
+# 20180702 1.0   gjwillems   created
+# 20180925 1.1   gjwillems   NOEXEC (check) "option" added.
+# 20180926 1.2   gjwillems   noexec bug fixed; more verbose output
+# 20180927 1.3   gjwillems   remove old EBSP files
+# 20181001 1.4   gjwillems   highligting added on fails and succes 
+# 20181116 1.5   gjwillems   libgeneric.sh added
+# 20181123 1.6   gjwillems   checks on synlinked files improved; config function
+#                            added 
+#
+# ------------------------------------------------------------------------------
+#                        COPYRIGHT (C) 2000-2019, ITASSIST
+################################################################################
+# set -xv
+
+# ====== Aliasses  =============================================================
+# ---- Local variables and initialisation --------------------------------------
+#
+TS=$(date +"%T %F")
+BASELINE_NETWORK_DIR="/data/app/oracle/network/admin"
+BASELINE_CONF_DIR="/data/shared/oracle/conf"
+BASELINE_PFILE_DIR="/data/app/oracle/admin/${ORACLE_SID}/pfile"
+
+RED=$'\033[31m'
+BLUEW=$'\033[44m'
+OFF=$'\033[0m'
+GREEN=$'\033[32m'
+
+localhost=$(hostname -s)
+ebsprod="ux330"
+PRDSID="EBSP0"
+sdflag=0
+ldap_ora="${BASELINE_NETWORK_DIR}/ldap.ora"
+sqlnet_ora="${BASELINE_NETWORK_DIR}/sqlnet.ora"
+
+_output_="#"
+_exec_=''
+[[ ! -z ${NOEXEC} ]] && _exec_="_no_exec_" && _output_=
+
+source "${GLOBAL_LIB:-/data/shared/global/lib}/libgeneric.sh"
+
+# ==============================================================================
+# show version information of this library
+# ---------------------------V--------------------------------------------------
+function liborabaseline_version() { ## print the current libbash version
+   local _self_=${FUNCNAME[0]}
+   local LIB="liborabaseline.sh"
+   local LIB_REV="$Revision: 1.6 $"
+   local LIB_BUILT="Fri Nov 23 12:32:35 CET 2018"
+
+   printf "%s revision %s build: %s\n" "${LIB}" "${LIB_REV}" "${LIB_BUILT}"
+}
+
+# ====== Functions =============================================================
+# 34567890123456789012345678
+# ---------------------------V--------------------------------------------------
+
+# ====== check_host ============================================================
+# check on which host the library functions are called 
+# ---------------------------V--------------------------------------------------
+function check_host() {
+   local _self_=${FUNCNAME[0]}
+   local F=${1} 
+
+   [[ "${localhost}" == "${ebsprod}" ]] && out \
+      "${_self_} execution of ${F} is stricktly PROHIBITED on $(hostname -s)" && \
+      return 1
+   return 0
+}
+
+# ====== _no_exec_ =============================================================
+# if NOEXEC is set only show what would be done
+# ---------------------------V--------------------------------------------------
+function _no_exec_() {
+   local _self_=${FUNCNAME[0]}
+#   [[ -z ${NOEXEC} ]] || [[ -z ${NOEXEC} ]] && return 0
+   line="${@}"
+   out "${_self_} of command(s) => ${line}"
+}
+
+# ==============================================================================
+# Create forced a new oracle password file in DBB baseline
+# ------------------------------------------------------------------------------
+function bl_orapwdfile () {
+   local _self_=${FUNCNAME[0]}
+
+   check_host ${_self_} ; [[ $? -eq 1 ]] && return 1
+
+   [[ ${sdflag} -eq 0 ]] && [[ ${NOEXEC} -eq 1 ]] && \
+      out "${BLUEW}NOEXEC mode is turned ON!${OFF}" && sdflag=1
+
+   [[ -z ${ORACLE_HOME} ]] && out "ORACLE_HOME not set" ERROR \
+                           && return 1
+   [[ -z ${ORACLE_SID} ]]  && out "ORACLE_SID not set"  ERROR \
+                           && return 1
+
+   out "${_self_} checking password file configuration"
+   out "${_self_} FORCING a new password file"
+
+   SOURCE_FILE="${ORACLE_HOME}/dbs/orapw${ORACLE_SID}"
+   TARGET_FILE="/data/app/oracle/admin/${ORACLE_SID}/pfile/orapw${ORACLE_SID}"
+
+   if [[ -L ${SOURCE_FILE} ]]; then
+      out "${_self_} seems to be ${GREEN}OK${OFF} ${SOURCE_FILE} is a symlink"
+   else
+      out "${_self_} ${RED}Not OK! ${SOURCE_FILE} does not exists${OFF}"
+   fi
+
+   getp ${GLOBAL_CNF}/sys.dat
+
+   ${_exec_} orapwd file=${TARGET_FILE} force=y password=${DWP}
+
+   [[ -s ${TARGET_FILE} ]] && ${_exec_} ln -sf ${TARGET_FILE} ${SOURCE_FILE}
+
+   ${_exec_} out "Oracle password file [${TARGET_FILE}] configuration complete."
+
+   return 0
+}
+
+
+# ==============================================================================
+# (Re-)Link forced the Oracle Network files
+# ------------------------------------------------------------------------------
+function bl_oranetwork () {
+   local _self_=${FUNCNAME[0]}
+
+   check_host ${_self_}; [[ $? -eq 1 ]] && return 1
+
+   [[ ${sdflag} -eq 0 ]] && [[ ${NOEXEC} -eq 1 ]] && \
+      out "${BLUEW}NOEXEC mode is turned ON!${OFF}" && sdflag=1
+
+   [[ -z ${ORACLE_HOME} ]] && out "ORACLE_HOME not set" ERROR \
+                           && return 1
+
+   out "${_self_} checking Oracle Net config files"
+
+   if [[ ! -d ${BASELINE_NETWORK_DIR} ]]; then
+      ${_exec_} mkdir -p ${BASELINE_NETWORK_DIR} \
+      out "${_self_} network directory does not exists, ${BASELINE_NETWORK_DIR} created"
+   else
+      out "${_self_} ${GREEN}OK, network directory, ${BASELINE_NETWORK_DIR} exists${OFF}"
+   fi
+
+   tnsnames_ora="${ORACLE_HOME}/network/admin/tnsnames.ora"
+
+   ${_exec_} out "create network files backups to <name>.$$"
+
+   [[ -s ${ldap_ora} ]]   && ${_exec_} mv ${ldap_ora} ${ldap_ora}.$$
+   [[ -s ${sqlnet_ora} ]] && ${_exec_} mv ${sqlnet_ora} ${sqlnet_ora}.$$
+
+   ${_exec_} out "copy the valid config files to [${BASELINE_NETWORK_DIR}] "
+
+   ${_exec_} cp ${BASELINE_CONF_DIR}/ldap.ora   ${BASELINE_NETWORK_DIR}/
+   ${_exec_} cp ${BASELINE_CONF_DIR}/sqlnet.ora ${BASELINE_NETWORK_DIR}/
+   
+   [[ ! -s ${tnsnames_ora} ]] && out "${RED}EBS requirement! file does NOT exists: [${tnsnames_ora}]${OFF}"
+
+   out "${_self_} FORCING sym links to Oracle Net config files"
+
+   ${_exec_} ln -sf  ${ldap_ora}   ${ORACLE_HOME}/network/admin
+   ${_exec_} ln -sf  ${sqlnet_ora} ${ORACLE_HOME}/network/admin
+   ${_exec_} out "symlinks creates for the network files" 
+
+   return 0
+}
+
+# ==============================================================================
+# Create forced  oracle init file in DBB baseline
+# ------------------------------------------------------------------------------
+function bl_initfile () {
+   local _self_=${FUNCNAME[0]}
+
+   check_host ${_self_}; [[ $? -eq 1 ]] && return 1
+
+   [[ ${sdflag} -eq 0 ]] && [[ ${NOEXEC} -eq 1 ]] && \
+      out "${BLUEW}NOEXEC mode is turned ON!${OFF}" && sdflag=1
+
+   [[ -z ${ORACLE_HOME} ]] && out "ORACLE_HOME not set" ERROR \
+                           && return 1
+   [[ -z ${ORACLE_SID} ]]  && out "ORACLE_SID not set"  ERROR \
+                           && return 1
+
+   out "${_self_} checking spfile configuration"
+
+   ${_exec_} out "Oracle Baseline spfile location: [${BASELINE_PFILE_DIR}]"
+   if [[ ! -d ${BASELINE_PFILE_DIR} ]]; then
+      ${_exec_} mkdir -p ${BASELINE_PFILE_DIR} 
+      ${_exec_} out "pfile directory does not exists, ${BASELINE_PFILE_DIR} created"
+   else
+      out "${_self_} ${GREEN}OK, spfile directory, ${BASELINE_PFILE_DIR} exists${OFF}"
+   fi
+
+   spfile_ora="${ORACLE_HOME}/dbs/spfile${ORACLE_SID}.ora"
+
+   if [[ ! -s ${spfile_ora} ]]; then
+      out "${RED}Oracle parameter file ${spfile_ora} does NOT exist${OFF}" 
+      out "create a spfile first!" 
+      return 1
+   elif [[ ! -L ${spfile_ora} ]]; then
+      out "${RED}Oracle parameter file ${spfile_ora} is NOT a symlink${OFF}" 
+      ${_exec_} mv ${spfile_ora} ${BASELINE_PFILE_DIR}
+      ${_exec_} ln -sf ${BASELINE_PFILE_DIR}/spfile${ORACLE_SID}.ora ${spfile_ora} 
+   elif [[ -L ${spfile_ora} ]]; then
+      out "${GREEN}OK! Oracle parameter file ${spfile_ora} is symlinked${OFF}"
+   fi
+
+   return 0
+}
+
+# ==============================================================================
+# Cleanup EBS Prod config files
+# ------------------------------------------------------------------------------
+function bl_cleanupebscf () {
+   local _self_=${FUNCNAME[0]}
+   local fflg=
+
+   [[ ${sdflag} -eq 0 ]] && [[ ${NOEXEC} -eq 1 ]] && \
+      out "${BLUEW}NOEXEC mode is turned ON!${OFF}" && sdflag=1
+
+   check_host ${_self_}; [[ $? -eq 1 ]] && return 1
+
+   out "${_self_} checking old Oracle config files"
+
+   for file in $(ls -1 ${ORACLE_HOME}/dbs | grep ${PRDSID})
+   do
+      ${_exec_} rm -f ${ORACLE_HOME}/dbs/${file} 
+      fflg=1 
+      out "${_self_} removing old configuration file [${file}]"
+   done
+
+   [[ -z ${fflg} ]] && out "No old Oracle config files found."
+}
+
+# ==============================================================================
+# show configuration 
+# ---------------------------V--------------------------------------------------
+function bl_show_configuration() {
+   local _self_=${FUNCNAME[0]}
+   
+   printf "\\nliborabaeline.sh configuration files:\\n"
+   printf "Directories:\\n"
+   printf "BASELINE_NETWORK_DIR => %s\\n" "${BASELINE_NETWORK_DIR}"
+   printf "BASELINE_CONF_DIR    => %s\\n" "${BASELINE_CONF_DIR}"
+   printf "BASELINE_PFILE_DIR   => %s\\n" "${BASELINE_PFILE_DIR}"
+   printf "Files:\\n"
+   printf "sqlnet.ora           => %s\\n" "${sqlnet_ora}"
+   printf "ldap.ora             => %s\\n" "${ldap_ora}"
+   printf "\\n" 
+}
+
+
+# ==============================================================================
+# export the functions
+# ---------------------------V--------------------------------------------------
+_export_functions_
+# ====== end of liborabaseline.sh
